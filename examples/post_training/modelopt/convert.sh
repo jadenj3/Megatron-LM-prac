@@ -6,8 +6,12 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}/conf/arguments.sh"
 
 # Default arguments of this script
-MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format --export-te-mcore-model --use-cpu-initialization"
-
+MLM_DEFAULT_ARGS="
+    --distributed-timeout-minutes 60 \
+    --finetune \
+    --auto-detect-ckpt-format \
+    --export-te-mcore-model \
+"
 
 if [ -z ${HF_TOKEN} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}HF_TOKEN${WHITE} is not set! HF snapshot download may fail!\n"
@@ -23,10 +27,15 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
     if [ -z ${HF_MODEL_CKPT} ]; then
         HF_MODEL_CKPT=${1}
     fi
+    printf "${MLM_WARNING} Importing a Hugging Face checkpoint from convert.sh is deprecated.\n"
+    printf "Use Megatron-Bridge to create a Megatron-Core checkpoint, then set ${PURPLE}MLM_MODEL_CKPT${WHITE}.\n"
+    printf "For Hugging Face quantization workflows, see https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/quantization\n"
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/convert_model.py \
         ${MODEL_ARGS} \
         --tensor-model-parallel-size ${TP} \
+        --expert-tensor-parallel-size ${ETP} \
         --pipeline-model-parallel-size ${PP} \
+        --expert-model-parallel-size ${EP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --pretrained-model-path ${HF_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \
@@ -35,7 +44,9 @@ else
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/convert_model.py \
         ${MODEL_ARGS} \
         --tensor-model-parallel-size ${TP} \
+        --expert-tensor-parallel-size ${ETP} \
         --pipeline-model-parallel-size ${PP} \
+        --expert-model-parallel-size ${EP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --load ${MLM_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \

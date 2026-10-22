@@ -3,42 +3,41 @@
 """Sample Generate"""
 import os
 import sys
+import warnings
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import os
 import sys
 from argparse import Namespace
 from contextlib import nullcontext
-from typing import Union
 
+import torch
+
+from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.engines.mcore_engine import MCoreEngine
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-import torch
-
-import megatron
-from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
-from megatron.core.models.gpt import GPTModel
-from megatron.training import get_model
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
+from megatron.core.inference.text_generation_server import MegatronServer
+from megatron.core.inference.text_generation_server.run_mcore_engine import run_mcore_engine
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import import_module
-from megatron.inference.text_generation import beam_search_and_post_process
-from megatron.inference.text_generation.mcore_engine_server import (
-    ModelInferenceWrapperServer,
-    run_mcore_engine,
-)
-from megatron.inference.text_generation_server import MegatronServer
-from megatron.training import print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+from megatron.inference.utils import get_model_builder
+from megatron.post_training.arguments import add_modelopt_args
+from megatron.training import get_model, print_rank_0
+from megatron.training.global_vars import set_run_config
+
+try:
+    from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+
+    HAS_NVIDIA_MODELOPT = True
+except ImportError:
+    HAS_NVIDIA_MODELOPT = False
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -46,76 +45,10 @@ sys.path.append(
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-
-
-def model_provider(
-    pre_process=True, post_process=True
-) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
-    """Builds the model.
-
-    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the core GPT model.
-
-    Args:
-        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
-        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
-
-
-    Returns:
-        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
-    """
-
-    args = get_args()
-    use_te = args.transformer_impl == "transformer_engine"
-
-    print_rank_0('building GPT model ...')
-
-    # Experimental loading arguments from yaml
-    if args.yaml_cfg is not None:
-        config = core_transformer_config_from_yaml(args, "language_model")
-    else:
-        config = core_transformer_config_from_args(args)
-
-    if args.use_legacy_models:
-        model = megatron.legacy.model.GPTModel(
-            config,
-            num_tokentypes=0,
-            parallel_output=False,
-            pre_process=pre_process,
-            post_process=post_process,
-        )
-    else:
-        if args.spec is not None:
-            transformer_layer_spec = import_module(args.spec)
-        else:
-            if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
-                )
-            else:
-                transformer_layer_spec = get_gpt_layer_local_spec(
-                    args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
-                )
-
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=False,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent,
-            rotary_base=args.rotary_base,
-            rope_scaling=args.use_rope_scaling,
-            rope_scaling_factor=args.rope_scaling_factor,
-        )
-
-    return model
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
@@ -131,27 +64,24 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     Returns:
         AbstractBackend: The chosen backend
     """
+    # TODO(ksanthanam): Convert this to use dynamic inference counterparts
+
     tokenizer = get_tokenizer()
 
-    inference_wrapper_config = InferenceWrapperConfig(
-        hidden_size=args.hidden_size,
-        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
-        fp32_residual_connection=args.fp32_residual_connection,
-        params_dtype=args.params_dtype,
-        padded_vocab_size=args.padded_vocab_size,
-        inference_max_seq_length=args.inference_max_seq_length,
-        inference_max_requests=args.inference_max_batch_size,
-        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill
+    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_sequence_length)
+    inference_wrapped_model = GPTInferenceWrapper(
+        model, inference_context
     )
-
-    inference_wrapped_model = ModelInferenceWrapperServer(model, inference_wrapper_config)
-    text_generation_controller = TextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
+    text_generation_controller = TextGenerationController(
+        inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
+    )
     return StaticInferenceEngine(
-        text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
+        text_generation_controller=text_generation_controller,
     )
 
 
 def add_text_generate_args(parser):
+    """Adds text generation arguments to parser."""
     group = parser.add_argument_group(title='text generation')
     group.add_argument(
         "--port", type=int, default=5000, help='port for text generation server to run on'
@@ -176,16 +106,22 @@ def add_text_generate_args(parser):
         metavar='N',
         type=str,
         nargs='+',
-        help='Input prompts with each prompt within quotes and seperated by space',
+        help='Input prompts with each prompt within quotes and separated by space',
     )
     group.add_argument(
-        "--max-batch-size", type=int, default=8, help='Max number of prompts to process at once'
+        "--max-batch-size",
+        type=int,
+        default=None,
+        help='Deprecated in favor of `--inference-max-batch-size`',
     )
+    add_modelopt_args(parser)
     return parser
 
 
-if __name__ == "__main__":
-    initialize_megatron(
+@torch.inference_mode()
+def main(model_type: str = "gpt"):
+    """Runs the text generation server with the specified model type."""
+    args = parse_and_validate_args(
         extra_args_provider=add_text_generate_args,
         args_defaults={
             'no_load_rng': True,
@@ -193,7 +129,8 @@ if __name__ == "__main__":
             'exit_on_missing_checkpoint': True,
         },
     )
-
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
@@ -208,10 +145,21 @@ if __name__ == "__main__":
 
         load_context = fp8_model_init()
     with load_context:
-        model = get_model(model_provider, wrap_with_ddp=False)
+        if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+            # ModelOpt path keeps the legacy callable-based builder because the
+            # modelopt hooks have not been ported to the new ``ModelBuilder``
+            # API yet. ``get_model`` also handles the modelopt-checkpoint
+            # auto-detection side effect.
+            model = get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+        else:
+            builder = get_model_builder(args, provider=model_type)
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            model = builder.build_distributed_models(
+                pg_collection=pg_collection, wrap_with_ddp=False
+            )
 
     if args.load is not None:
-        _ = load_checkpoint(model, None, None)
+        _ = load_checkpoint(model, None, None, strict=False)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
@@ -219,13 +167,17 @@ if __name__ == "__main__":
 
     inference_engine = get_inference_engine(args, model)
 
-    if args.enable_cuda_graph:
+    if args.cuda_graph_impl == "local":
         print(f"Running warmup for CUDA graphs...")
         inference_engine.generate(
             prompts=["Test prompt"], sampling_params=SamplingParams(num_tokens_to_generate=10)
         )
 
-    if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
+    if (
+        mpu.is_pipeline_first_stage()
+        and mpu.get_tensor_model_parallel_rank() == 0
+        and mpu.get_expert_model_parallel_rank() == 0
+    ):
         server = MegatronServer(inference_engine, args)
         server.run("0.0.0.0", port=args.port)
 
@@ -238,7 +190,7 @@ if __name__ == "__main__":
             except ValueError as ve:
                 pass
         elif choice.item() == 1:
-            try:
-                beam_search_and_post_process(inference_engine.text_generation_controller.inference_wrapped_model.model)
-            except ValueError as ve:
-                pass
+            break
+
+if __name__ == "__main__":
+    main(model_type="gpt")

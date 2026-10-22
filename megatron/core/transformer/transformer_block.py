@@ -1,8 +1,9 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Set, Union, cast
 
 import torch
 from torch import Tensor
@@ -11,55 +12,95 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ModelCommProcessGroups
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.recompute import checkpointed_forward
+from megatron.core.tensor_observation import observe_layer_residuals
+from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    build_mhc_recompute_layer_plan,
+    finalize_mhc_recompute_layer,
+)
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.typed_torch import apply_module, not_none
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    get_pg_rank,
+    make_viewless_tensor,
+)
 
 try:
-    from megatron.core.extensions.transformer_engine import (
-        TENorm,
-        get_cpu_offload_context,
-        te_checkpoint,
-    )
+    import apex  # pylint: disable=unused-import
 
-    HAVE_TE = True
-    LayerNormImpl = TENorm
+    HAVE_APEX = True
 except ImportError:
-    HAVE_TE = False
-    get_cpu_offload_context = None
+    HAVE_APEX = False
 
-    try:
-        import apex  # pylint: disable=unused-import
+get_cpu_offload_context = None
+te_checkpoint = None
 
-        LayerNormImpl = FusedLayerNorm
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import TENorm, get_cpu_offload_context
 
-    except ImportError:
-        from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    LayerNormImpl = TENorm
 
-        LayerNormImpl = WrappedTorchNorm
+elif HAVE_APEX:
+    LayerNormImpl = FusedLayerNorm
+
+else:
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+    LayerNormImpl = WrappedTorchNorm
 
 
-def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
+logger = logging.getLogger(__name__)
+
+
+def get_num_layers_to_build(
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.
     Args:
         config (TransformerConfig): Configuration object containing transformer model parameters.
         vp_stage (Optional[int]): Virtual pipeline stage number.
+        pp_rank (Optional[int]): Pipeline parallel rank.
 
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
+    # If we have a custom PP layout, straightforwardly
+    # return the number of decoders in the layout array.
+    if config.pipeline_model_parallel_layout is not None:
+        return config.pipeline_model_parallel_layout.get_num_layers_to_build(
+            layer_type=LayerType.decoder, vp_stage=vp_stage
+        )
+
+    # Fallback for legacy tests.
+    if pp_rank is None:
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+
+    is_first_pp_stage = pp_rank == 0
+    is_last_pp_stage = pp_rank == config.pipeline_model_parallel_size - 1
+
     if (
         config.num_layers_in_first_pipeline_stage is not None
         or config.num_layers_in_last_pipeline_stage is not None
@@ -73,7 +114,7 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
         # Number of layers to distribute over rest of pipeline stages
         layers_to_distribute = config.num_layers
         # Number of pipeline stages left for distributing transformer layers
-        pipeline_stages_left = parallel_state.get_pipeline_model_parallel_world_size()
+        pipeline_stages_left = config.pipeline_model_parallel_size
 
         # If the uneven first (last) pipeline stage is enabled, remove the specified number
         # of layers to calculate the number of layers on each middle pipeline stage.
@@ -85,24 +126,24 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
             layers_to_distribute -= config.num_layers_in_last_pipeline_stage
             pipeline_stages_left -= 1
 
-        assert (
-            layers_to_distribute % pipeline_stages_left == 0
-        ), "With uneven pipelineing the left over layers must be divisible by left over stages"
-        num_layers_per_pipeline_rank = layers_to_distribute // pipeline_stages_left
+        # If pp_size <= 2, we do not have any intermediate pipeline stages, and we do not
+        # need to check if the left over layers are divisible by the left over stages.
+        if pipeline_stages_left > 0:
+            assert (
+                layers_to_distribute % pipeline_stages_left == 0
+            ), "With uneven pipelineing the left over layers must be divisible by left over stages"
+            num_layers_per_pipeline_rank = layers_to_distribute // pipeline_stages_left
+        else:
+            num_layers_per_pipeline_rank = 0
 
         # If the uneven first (last) pipeline stage is enabled, return the specified number
         # of layers for all virtual pipeline parallel stages within the first (last) pipeline
         # parallel stage.
-        if (
-            parallel_state.is_pipeline_first_stage(ignore_virtual=True)
-            and config.num_layers_in_first_pipeline_stage is not None
-        ):
+
+        if is_first_pp_stage and config.num_layers_in_first_pipeline_stage is not None:
             num_layers_per_pipeline_rank = config.num_layers_in_first_pipeline_stage
 
-        if (
-            parallel_state.is_pipeline_last_stage(ignore_virtual=True)
-            and config.num_layers_in_last_pipeline_stage is not None
-        ):
+        if is_last_pp_stage and config.num_layers_in_last_pipeline_stage is not None:
             num_layers_per_pipeline_rank = config.num_layers_in_last_pipeline_stage
     else:
         # Include the embedding layer and loss layer into pipeline parallelism partition
@@ -115,13 +156,11 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
 
         assert (
             num_layers % config.pipeline_model_parallel_size == 0
-        ), "num_layers should be divisible by pipeline_model_parallel_size"
+        ), f"{num_layers=} should be divisible by {config.pipeline_model_parallel_size=}"
         num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
-    if (
-        parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
-        and config.pipeline_model_parallel_size > 1
-    ):
+    vp_size = config.virtual_pipeline_model_parallel_size
+    if vp_size is not None and config.pipeline_model_parallel_size > 1:
         # Interleaved pipeline parallelism:
         # Number of layers in each model chunk is the number of layers in the stage,
         # divided by the number of model chunks in a stage.
@@ -133,7 +172,6 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
         # layers to stages like (each list is a model chunk):
         # Stage 0: [0, 1]  [4, 5]
         # Stage 1: [2, 3]  [6, 7]
-        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
         assert (
             num_layers_per_pipeline_rank % vp_size == 0
@@ -151,19 +189,17 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
     # The embedding (or loss) layer cannot function as a standalone transformer layer
     # Reduce the number of layers to construct by 1 on the first (or last) stage if the
     # embedding (or loss) layer is included in the pipeline parallelism partition and placement.
-    if (
-        parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
-        and config.account_for_embedding_in_pipeline_split
-    ):
-        num_layers_to_build -= 1
-        assert num_layers_to_build >= 0, "Not enough layers in the first virtual pipeline stage"
+    if config.account_for_embedding_in_pipeline_split:
+        if is_vp_first_stage(vp_stage, vp_size) and is_first_pp_stage:
+            num_layers_to_build -= 1
+            assert (
+                num_layers_to_build >= 0
+            ), f"Not enough layers in the first virtual pipeline stage"
 
-    if (
-        parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
-        and config.account_for_loss_in_pipeline_split
-    ):
-        num_layers_to_build -= 1
-        assert num_layers_to_build >= 0, "Not enough layers in the last virtual pipeline stage"
+    if config.account_for_loss_in_pipeline_split:
+        if is_vp_last_stage(vp_stage, vp_size) and is_last_pp_stage:
+            num_layers_to_build -= 1
+            assert num_layers_to_build >= 0, f"Not enough layers in the last virtual pipeline stage"
 
     return num_layers_to_build
 
@@ -184,14 +220,15 @@ class TransformerBlockSubmodules:
             or instance of the layer normalization to be applied.
     """
 
-    layer_specs: List[ModuleSpec] = None
-    layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
+    layer_specs: Optional[List[ModuleSpec]] = None
+    layer_norm: LayerNormBuilder | None = None
 
 
 def _get_block_submodules(
     config: TransformerConfig,
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """
     Retrieve or construct TransformerBlockSubmodules based on the provided specification.
@@ -218,7 +255,7 @@ def _get_block_submodules(
         if issubclass(spec.module, TransformerBlock):
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
-            num_layers = get_num_layers_to_build(config, vp_stage)
+            num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
             )
@@ -228,7 +265,7 @@ def _get_block_submodules(
         raise Exception(f"specialize for {type(spec).__name__}.")
 
 
-class TransformerBlock(MegatronModule):
+class TransformerBlock(GraphableMegatronModule, MegatronModule):
     """Transformer class."""
 
     def __init__(
@@ -238,16 +275,26 @@ class TransformerBlock(MegatronModule):
         post_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
 
-        self.submodules = _get_block_submodules(config, spec, vp_stage)
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
+
+        pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
+        pp_rank = get_pg_rank(pp_group)
+
+        self.submodules = _get_block_submodules(config, spec, vp_stage, pp_rank)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self.name = name
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -258,13 +305,15 @@ class TransformerBlock(MegatronModule):
         )
 
         if get_cpu_offload_context is not None:
-            (self.offload_context, self.group_prefetch_offload_commit_async) = (
+            self.offload_context, self.group_prefetch_offload_commit_async = (
                 get_cpu_offload_context(
                     self.config.cpu_offloading,
                     self.config.cpu_offloading_num_layers,
                     self.config.num_layers,
                     self.config.cpu_offloading_activations,
                     self.config.cpu_offloading_weights,
+                    self.config.cpu_offloading_double_buffering,
+                    self.config.cpu_offloading_retain_pinned_cpu_buffers,
                 )
             )
             self.config._cpu_offloading_context = (
@@ -278,10 +327,12 @@ class TransformerBlock(MegatronModule):
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config._cpu_offloading_context = None
 
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
-        self.model_comm_pgs = model_comm_pgs
-
+        self.mhc_num_residual_streams = config.mhc_num_residual_streams
+        self.mhc_recompute_enabled = (
+            config.enable_mhc_connections
+            and config.recompute_granularity == 'selective'
+            and 'mhc' in config.recompute_modules
+        )
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -294,21 +345,54 @@ class TransformerBlock(MegatronModule):
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
             global_layer_number = layer_number + get_transformer_layer_offset(
-                self.config, self.vp_stage
+                self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
             )  # 1-based index
             if self.config.heterogeneous_block_specs:
                 layer_config = self.config.get_config_for_layer(global_layer_number)
             else:
                 layer_config = self.config
 
-            fp8_init_context = get_fp8_context(layer_config, global_layer_number - 1, is_init=True)
-            with fp8_init_context:
+            # Get appropriate quantization context (FP8 and FP4 are mutually exclusive)
+            if layer_config.fp8:
+                quantization_context = get_fp8_context(
+                    layer_config, global_layer_number - 1, is_init=True
+                )
+            elif layer_config.fp4:
+                quantization_context = get_fp4_context(
+                    layer_config, global_layer_number - 1, is_init=True
+                )
+            else:
+                quantization_context = nullcontext()
+
+            with quantization_context:
+                # Pass names so per-module recipes choose storage before TE allocates
+                # parameters. GPTModel's later finish_init() sets quantization overrides
+                # but does not replace existing weights: under global MXFP8 storage,
+                # even BF16-selected modules would otherwise get MXFP8 parameters.
+                # Loading a BF16 checkpoint into those parameters would quantize its
+                # values; converting back to BF16 cannot recover the lost precision.
+                # HybridStack already passes names during construction. Keep unnamed
+                # custom layer specs unchanged by omitting the extra keyword argument.
+                layer_kwargs = (
+                    {"name": f"{self.name}.layers.{layer_number - 1}"}
+                    if self.name is not None
+                    else {}
+                )
                 module = build_module(
                     layer_spec,
                     config=layer_config,
                     layer_number=layer_number,
-                    model_comm_pgs=self.model_comm_pgs,
+                    pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
+                    **layer_kwargs,
+                )
+            if layer_config.enable_mhc_connections and not getattr(
+                module, "supports_mhc_connections", False
+            ):
+                raise ValueError(
+                    f"{type(module).__name__} does not implement mHC residual streams. Build "
+                    "TransformerBlock with HyperConnectionTransformerLayer when "
+                    "enable_mhc_connections=True."
                 )
             return module
 
@@ -319,13 +403,14 @@ class TransformerBlock(MegatronModule):
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
+        if self.config.cuda_graph_impl == "local":
+            annotate_first_last_layer(self.layers)
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
-        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
-            self.final_layernorm = build_module(
-                self.submodules.layer_norm,
+        if self.has_final_layernorm_in_this_stage():
+            self.final_layernorm = not_none(self.submodules.layer_norm)(
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
@@ -333,109 +418,64 @@ class TransformerBlock(MegatronModule):
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
+        if self.config.inference_fuse_tp_communication:
+            self._setup_fused_tp_communication()
+
+    def has_final_layernorm_in_this_stage(self):
+        """
+        Check if this vpp stage contains the final layernorm.
+
+        Note:
+            Final layernorm now has been moved from the post-process stage to the last decoder
+            layer by using this function.
+            There will be a small numeric difference because of grad norm reduction when final
+            layernorm is placed in different pipeline stages in deterministic mode. It can still
+            be bitwise aligned by disabling grad norm clipping.
+        """
+        if self.config.mtp_num_layers is None:
+            # for model without MTPLayer, the final layernorm is set in the stage which does
+            # post_process
+            return self.submodules.layer_norm and self.post_process and self.post_layer_norm
+        else:
+            # for model with MTPLayer, the final layernorm is set in the stage which has the
+            # last layer of the decoder
+            has_final_layernorm_in_this_stage = False
+            for layer in self.layers:
+                if layer.layer_number == self.config.num_layers:
+                    has_final_layernorm_in_this_stage = True
+                    break
+            return (
+                self.submodules.layer_norm
+                and has_final_layernorm_in_this_stage
+                and self.post_layer_norm
+            )
+
+    def _setup_fused_tp_communication(self):
+        """Setup fused TP communication for all layers.
+        We have a fused reduce-scatter + add + layer-norm + all-gather operation.
+        We call this kernel from within row parallel linear layers.
+        But layer-norm needs the layer norm weights from the
+        successive column parallel linear layer.
+        This function is used to pass those weights to the respective layers.
+        """
+
+        for i in range(len(self.layers)):
+            current_layer = self.layers[i]
+
+            # Get next layer's QKV norm weights (None for last layer)
+            if i < len(self.layers) - 1:
+                next_qkv_norm_weights = self.layers[i + 1].get_qkv_layer_norm_weights()
+            else:
+                next_qkv_norm_weights = None
+
+            # Configure all fused TP communication settings in one call
+            current_layer.configure_fused_tp_inference(
+                skip_qkv_norm_and_all_gather=(i > 0),
+                fc2_next_layer_norm_weights=next_qkv_norm_weights,
+            )
+
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
-
-    def _checkpointed_forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        context: Tensor,
-        context_mask: Tensor,
-        rotary_pos_emb: Tensor,
-        attention_bias: Tensor,
-        packed_seq_params: PackedSeqParams,
-        use_inner_fp8_context: bool,
-    ):
-        """Forward method with activation checkpointing."""
-
-        def custom(start: int, end: int):
-            def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb
-            ):
-                for index in range(start, end):
-                    layer = self._get_layer(index)
-                    inner_fp8_context = (
-                        get_fp8_context(self.config, layer.layer_number - 1)
-                        if use_inner_fp8_context
-                        else nullcontext()
-                    )
-                    with inner_fp8_context:
-                        hidden_states, context = layer(
-                            hidden_states=hidden_states,
-                            attention_mask=attention_mask,
-                            context=context,
-                            context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            attention_bias=attention_bias,
-                            inference_context=None,
-                            packed_seq_params=packed_seq_params,
-                        )
-                return hidden_states, context
-
-            return custom_forward
-
-        def checkpoint_handler(forward_func):
-            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            if self.config.fp8:
-                return te_checkpoint(
-                    forward_func,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                )
-            else:
-                return tensor_parallel.checkpoint(
-                    forward_func,
-                    self.config.distribute_saved_activations,
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                )
-
-        if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
-            layer_idx = 0
-            while layer_idx < self.num_layers_per_pipeline_rank:
-                hidden_states, context = checkpoint_handler(
-                    custom(layer_idx, layer_idx + self.config.recompute_num_layers)
-                )
-
-                layer_idx += self.config.recompute_num_layers
-
-        elif self.config.recompute_method == 'block':
-            # Checkpoint the input activation of only a set number of individual
-            # Transformer layers and skip the rest.
-            # A method fully use the device memory removing redundant re-computation.
-            recompute_skip_num_layers = 0
-            for layer_idx in range(self.num_layers_per_pipeline_rank):
-                # Skip recomputation when input grad computation is not needed.
-                # Need to have at least one input tensor with gradient computation
-                # for re-enterant autograd engine.
-                if self.config.fp8 and not hidden_states.requires_grad:
-                    recompute_skip_num_layers += 1
-                if (
-                    layer_idx >= recompute_skip_num_layers
-                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
-                ):
-                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
-                else:
-                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
-                    )
-        else:
-            raise ValueError("Invalid activation recompute method.")
-
-        return hidden_states
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -447,6 +487,39 @@ class TransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        if (
+            InferenceMode.is_active()
+            and hasattr(self, 'cudagraph_manager')
+            and kwargs['attention_mask'] is None
+            and (
+                kwargs.get('inference_context') is not None
+                or kwargs.get('inference_params') is not None
+            )
+            and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        ):
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+
+            if using_cuda_graph:
+                return True
+        return False
+
+    def __call__(self, *args, **kwargs):
+        if self._should_call_local_cudagraph(*args, **kwargs):
+            kwargs['hidden_states'] = (
+                kwargs['hidden_states'].unwrap()
+                if isinstance(kwargs['hidden_states'], WrappedTensor)
+                else kwargs['hidden_states']
+            )
+            return super().__call__(*args, **kwargs)[0]
+        return super().__call__(*args, **kwargs)
+
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -456,12 +529,16 @@ class TransformerBlock(MegatronModule):
         rotary_pos_emb: Optional[Tensor] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        extract_layer_indices: Optional[Set[int]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        dynamic_inference_decode_only: Optional[bool] = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -479,6 +556,10 @@ class TransformerBlock(MegatronModule):
             context (Tensor, optional): Context tensor for cross-attention.
             context_mask (Tensor, optional): Mask for cross-attention context
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
+            rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
+            Currently used exclusively for inference with dynamic batching and flashinfer RoPE.
             attention_bias (Tensor): Bias tensor for Q * K.T of shape in shape broadcastable
                 to [b, num_head, sq, skv], e.g. [1, 1, sq, skv].
                 Used as an alternative to apply attention mask for TE cuDNN attention.
@@ -486,13 +567,42 @@ class TransformerBlock(MegatronModule):
                 optimizations.
             packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
                 processing.
+            extract_layer_indices (Set[int], optional): A set of global
+                layer indices (0-based across all pipeline stages) from
+                which to extract intermediate hidden states. If
+                non-empty, the forward pass will collect hidden_states
+                after each specified layer.
+            dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
+                inference context is for decode-only. This args is only used to uniquely
+                identify decode and non-decode cuda graph runners in the cuda graph manager.
 
         Returns:
-            Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
-            [s, b, h], and optionally the updated context tensor if cross-attention is used.
+            Union[Tensor, Tuple[Tensor, List[Tensor]]]:
+                - If extract_layer_indices is None or empty: Returns the output hidden states tensor
+                  of shape [s, b, h].
+                - If extract_layer_indices is non-empty: Returns a tuple
+                  of (hidden_states, intermediate_hidden_states) where
+                  intermediate_hidden_states is a list of tensors
+                  corresponding to hidden states after each layer in
+                  extract_layer_indices.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        # Remove 'dynamic_inference_decode_only' from kwargs if present
+        # this is only used to uniquely identify decode and non-decode cuda graph
+        # runners in the cuda graph manager
+
+        # Initialize feature collection (consistent with FastGen's Wan implementation)
+        if extract_layer_indices is None:
+            extract_layer_indices = set()
+        intermediate_hidden_states: List[Tensor] = []
+
+        # Calculate the global layer offset for this pipeline stage
+        # This is needed to convert local layer indices to global indices for feature extraction
+        pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
+        layer_offset = get_transformer_layer_offset(
+            self.config, self.vp_stage, get_pg_rank(pp_group)
+        )
 
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
@@ -501,10 +611,6 @@ class TransformerBlock(MegatronModule):
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
-
-        # Update the inference parameters with the current batch size in case it is variable
-        if inference_context and not self.training:
-            inference_context.current_batch_size = hidden_states.size(1)
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -523,6 +629,19 @@ class TransformerBlock(MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        # Expand hidden states for hyper connections at the start of the block
+        # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage
+        if self.config.enable_mhc_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.mhc_num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+            # An embedding-only stage sends this tensor without executing a
+            # layer. Expansion returns a view, which pipeline output
+            # deallocation cannot release; keep the autograd path viewless.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -533,14 +652,47 @@ class TransformerBlock(MegatronModule):
         # if we are using other fp8 recipes, then the context manager enter&exit are free
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
-        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
-        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
-        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+        # For FP4: NVFP4BlockScaling doesn't have delayed scaling, always uses inner context
+        if self.config.fp8:
+            use_outer_quantization_context = self.config.fp8_recipe == Fp8Recipe.delayed
+            use_inner_quantization_context = self.config.fp8_recipe != Fp8Recipe.delayed
+            outer_quantization_context = (
+                get_fp8_context(self.config) if use_outer_quantization_context else nullcontext()
+            )
+        elif self.config.fp4:
+            use_outer_quantization_context = False
+            use_inner_quantization_context = True
+            outer_quantization_context = nullcontext()
+        else:
+            # No quantization
+            use_outer_quantization_context = False
+            use_inner_quantization_context = False
+            outer_quantization_context = nullcontext()
 
-        with rng_context, outer_fp8_context:
+        # Managers retain per-forward checkpoint state, so allocate them for each training pass.
+        use_mhc_recompute = self.training and self.mhc_recompute_enabled
+        if use_mhc_recompute and len(extract_layer_indices) > 0:
+            # mHC recompute discards every checkpoint output in the block and restores them
+            # from a single hook on the block-end tensor. A loss taken on an extracted
+            # mid-block activation can reach those checkpoints before that hook fires and
+            # would read zero-sized storage.
+            raise NotImplementedError(
+                "'mhc' in recompute_modules is not supported together with "
+                "extract_layer_indices. The unified mHC recompute hook is registered on the "
+                "recompute-block boundary, so gradients entering from an extracted "
+                "intermediate layer can reach discarded activations before they are restored."
+            )
+        mhc_layer_managers, mhc_is_last_in_recompute_block = build_mhc_recompute_layer_plan(
+            num_layers=len(self.layers),
+            mhc_recompute_layer_num=self.config.mhc_recompute_layer_num,
+            use_mhc_recompute=use_mhc_recompute,
+        )
+
+        with rng_context, outer_quantization_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
-                hidden_states = self._checkpointed_forward(
+                checkpointed_result = checkpointed_forward(
+                    self,
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     context=context,
@@ -548,16 +700,50 @@ class TransformerBlock(MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
-                    use_inner_fp8_context=use_inner_fp8_context,
+                    use_inner_quantization_context=use_inner_quantization_context,
+                    padding_mask=padding_mask,
+                    extract_layer_indices=extract_layer_indices,
+                    layer_offset=layer_offset,
                 )
+                # Handle return value from _checkpointed_forward
+                if len(extract_layer_indices) > 0:
+                    # (hidden_states, intermediate_hidden_states) tuple
+                    hidden_states, intermediate_hidden_states = checkpointed_result
+                else:
+                    # No intermediate_hidden_states requested: just hidden_states
+                    hidden_states = checkpointed_result
             else:
                 for l_no, layer in enumerate(self.layers):
-                    inner_fp8_context = (
-                        get_fp8_context(self.config, layer.layer_number - 1)
-                        if use_inner_fp8_context
-                        else nullcontext()
+                    residual_accumulator = hidden_states
+                    # Get appropriate inner quantization context
+                    if use_inner_quantization_context:
+                        if self.config.fp8:
+                            inner_quantization_context = get_fp8_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        elif self.config.fp4:
+                            inner_quantization_context = get_fp4_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        else:
+                            inner_quantization_context = nullcontext()
+                    else:
+                        inner_quantization_context = nullcontext()
+
+                    mhc_manager = mhc_layer_managers[l_no]
+                    if mhc_manager is not None:
+                        mhc_manager.is_last_layer_in_recompute_block = (
+                            mhc_is_last_in_recompute_block[l_no]
+                        )
+
+                    # Only thread mhc_recompute_manager when the layer is mHC and a
+                    # manager actually exists. Plain TransformerLayer (and its
+                    # MoETransformerLayer subclass) doesn't accept this kwarg, and
+                    # its CUDA-graph machinery rejects unrecognized non-tensor kwargs.
+                    extra_layer_kwargs = (
+                        {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
                     )
-                    with self.offload_context, inner_fp8_context:
+                    with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -566,11 +752,20 @@ class TransformerBlock(MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             rotary_pos_cos=rotary_pos_cos,
                             rotary_pos_sin=rotary_pos_sin,
+                            rotary_pos_cos_sin=rotary_pos_cos_sin,
                             attention_bias=attention_bias,
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
+                            padding_mask=padding_mask,
+                            **extra_layer_kwargs,
                         )
+                    observe_layer_residuals(layer, residual_accumulator, hidden_states)
+                    finalize_mhc_recompute_layer(
+                        mhc_manager=mhc_manager,
+                        hidden_states=hidden_states,
+                        is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
+                    )
 
                     if (
                         torch.is_grad_enabled()
@@ -579,15 +774,33 @@ class TransformerBlock(MegatronModule):
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
+                    # Extract intermediate embeddings using global layer index
+                    if (l_no + layer_offset) in extract_layer_indices:
+                        intermediate_hidden_states.append(hidden_states)
+
+        # Only contract if the final layer norm is in this stage
+        if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
+            hidden_states = HyperConnectionModule.output_contract(
+                hidden_states, self.mhc_num_residual_streams
+            )  # [s, b, n*C] -> [s, b, C]
+
         # Final layer norm.
         if self.final_layernorm is not None:
-            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
+
+        # If this TransformerBlock is empty, input and output hidden states will be the same node
+        # on the computational graph and will lead to unexpected errors in pipeline schedules.
+        if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
+            hidden_states = hidden_states.clone()
+
+        if len(extract_layer_indices) > 0:
+            return hidden_states, intermediate_hidden_states
 
         return hidden_states
 
@@ -608,16 +821,37 @@ class TransformerBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the model.
         """
         assert not sharded_offsets, "Unexpected sharded offsets"
+        # TODO: remove multiple non_homogeneous_layers=True assignments
+        #  once non_homogeneous_layers=False support is dropped
         non_homogeneous_layers = metadata is not None and metadata.get(
             'non_homogeneous_layers', False
         )
+        if self.config.hetereogenous_dist_checkpoint:
+            non_homogeneous_layers = True
+
         if isinstance(self.config.moe_layer_freq, int):
             if self.config.moe_layer_freq > 1:
                 non_homogeneous_layers = True
         elif isinstance(self.config.moe_layer_freq, list):
             non_homogeneous_layers = True
 
+        if isinstance(self.config.linear_attention_freq, int):
+            if self.config.linear_attention_freq > 1:
+                non_homogeneous_layers = True
+        elif isinstance(self.config.linear_attention_freq, list):
+            non_homogeneous_layers = True
+
         if self.config.heterogeneous_block_specs:
+            non_homogeneous_layers = True
+
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        if singleton_local_shards:
+            if metadata is not None and metadata.get('non_homogeneous_layers') is False:
+                # non_homogeneous_layers=False was set explicitly - emit an override warning
+                logger.warning(
+                    'non_homogeneous_layers=False is deprecated.'
+                    ' Setting non_homogeneous_layers=True.'
+                )
             non_homogeneous_layers = True
 
         sharded_state_dict = {}
@@ -625,7 +859,9 @@ class TransformerBlock(MegatronModule):
         layer_prefix = f'{prefix}layers.'
         num_layers = self.config.num_layers
         for layer in self.layers:
-            offset = get_transformer_layer_offset(self.config, self.vp_stage)
+            offset = get_transformer_layer_offset(
+                self.config, self.vp_stage, get_pg_rank(self.pg_collection.pp)
+            )
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long
@@ -649,7 +885,11 @@ class TransformerBlock(MegatronModule):
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, metadata
+                        module,
+                        f'{prefix}{name}.',
+                        sharded_offsets,
+                        metadata,
+                        tp_group=self.tp_group,
                     )
                 )
 

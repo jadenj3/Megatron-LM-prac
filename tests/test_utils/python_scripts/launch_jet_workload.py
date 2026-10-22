@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import json
 import logging
 import os
@@ -6,8 +8,9 @@ import re
 import signal
 import sys
 import time
+import uuid
 import zipfile
-from typing import Dict, List, Optional
+from typing import Callable, Iterator, List, Optional
 
 import click
 import jetclient
@@ -17,7 +20,7 @@ import yaml
 from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
-from tests.test_utils.python_scripts import common
+from tests.test_utils.python_scripts import recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT")
@@ -40,6 +43,79 @@ def register_pipeline_terminator(pipeline: jetclient.JETPipeline):
     signal.signal(signal.SIGTERM, sigterm_handler)
 
 
+TERMINAL_PIPELINE_STATUSES = frozenset(
+    {
+        PipelineStatus.SUCCESS,
+        PipelineStatus.FAILED,
+        PipelineStatus.CANCELED,
+        PipelineStatus.SUBMISSION_FAILED,
+    }
+)
+
+
+class StatusPollTimeout(Exception):
+    """Raised by the watchdog when a single pipeline status poll exceeds its budget."""
+
+
+def wait_for_pipeline_completion(
+    pipeline: jetclient.JETPipeline,
+    max_wait_time: int = 60 * 60 * 12,
+    interval: int = 60,
+    poll_timeout: int = 60 * 3,
+) -> PipelineStatus:
+    """Block until a downstream JET pipeline reaches a terminal status.
+
+    jetclient's own ``pipeline.wait`` polls the GitLab API with no socket read
+    timeout and only re-checks ``max_wait_time`` between polls, so a silently
+    dropped TCP connection wedges ``recv`` forever and the wait never returns
+    (observed: a release job hung ~28h after its downstream had already
+    finished). This drives the status poll directly and guards each individual
+    poll with a SIGALRM watchdog, so a hung connection is interrupted and
+    retried, while a wall-clock deadline bounds the total wait.
+
+    Args:
+        pipeline: The submitted downstream JET pipeline to watch.
+        max_wait_time: Wall-clock budget in seconds before giving up.
+        interval: Seconds to sleep between status polls.
+        poll_timeout: Per-poll watchdog budget in seconds.
+
+    Returns:
+        The terminal status reached by the pipeline.
+
+    Raises:
+        jetclient.facades.objects.util.WaitTimeExceeded: If the pipeline does
+            not reach a terminal status within ``max_wait_time`` seconds.
+    """
+
+    def raise_poll_timeout(_signo, _stack_frame):
+        raise StatusPollTimeout
+
+    deadline = time.monotonic() + max_wait_time
+    previous_handler = signal.signal(signal.SIGALRM, raise_poll_timeout)
+    try:
+        while time.monotonic() < deadline:
+            signal.alarm(poll_timeout)
+            try:
+                status = pipeline.get_status()
+            except (StatusPollTimeout, jetclient.clients.gitlab.GitlabAPIError) as e:
+                logger.warning("Pipeline status poll failed (%s); retrying", type(e).__name__)
+                status = None
+            finally:
+                signal.alarm(0)
+
+            if status in TERMINAL_PIPELINE_STATUSES:
+                return status
+
+            time.sleep(interval)
+
+        raise jetclient.facades.objects.util.WaitTimeExceeded(
+            f"Pipeline {pipeline.jet_id} did not reach a terminal status "
+            f"within {max_wait_time} seconds"
+        )
+    finally:
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def launch_and_wait_for_completion(
     test_case: str,
     environment: str,
@@ -60,27 +136,30 @@ def launch_and_wait_for_completion(
 ) -> jetclient.JETPipeline:
     cluster_config = {"account": account}
     if partition is not None:
-        cluster_config['partition'] = partition
+        cluster_config["partition"] = partition
 
     n_submission_attempts = 0
     while n_submission_attempts < 3:
         try:
             pipeline = jetclient.JETClient(
-                customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
+                customer="mcore", gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
             ).workloads.submit(
-                workloads=common.load_workloads(
-                    test_case=test_case,
-                    n_repeat=n_repeat,
-                    time_limit=(1200 if enable_lightweight_mode else time_limit),
-                    tag=tag,
-                    scope=scope,
-                    container_image=container_image,
-                    container_tag=container_tag,
-                    platform=platform,
-                    environment=environment,
-                    record_checkpoints=record_checkpoints,
-                ),
-                config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
+                workloads=[
+                    jetclient.JETWorkloadManifest(**workload)
+                    for workload in recipe_parser.load_workloads(
+                        test_case=test_case,
+                        n_repeat=n_repeat,
+                        time_limit=(1200 if enable_lightweight_mode else time_limit),
+                        tag=tag,
+                        scope=scope,
+                        container_image=container_image,
+                        container_tag=container_tag,
+                        platform=platform,
+                        environment=environment,
+                        record_checkpoints=record_checkpoints,
+                    )
+                ],
+                config_id=f"mcore/{recipe_parser.resolve_cluster_config(cluster)}",
                 custom_config={
                     "launchers": {cluster: cluster_config},
                     "executors": {
@@ -88,6 +167,7 @@ def launch_and_wait_for_completion(
                             "environments": {
                                 cluster: {
                                     "variables": {
+                                        "PYTHONUNBUFFERED": "1",
                                         "RUN_NAME": run_name or "",
                                         "ENABLE_LIGHTWEIGHT_MODE": str(
                                             enable_lightweight_mode
@@ -103,20 +183,24 @@ def launch_and_wait_for_completion(
                                         "MCORE_BACKWARDS_COMMIT": (
                                             os.getenv("MCORE_BACKWARDS_COMMIT") or ""
                                         ),
+                                        "HF_HUB_CACHE": "/mnt/artifacts/hf_home/hub",
+                                        "TRANSFORMERS_OFFLINE": "1",
+                                        "CLUSTER": cluster,
+                                        "RUN_ID": str(uuid.uuid4()),
+                                        "CLEANUP_PATHS": os.getenv("CLEANUP_PATHS") or "",
                                     }
                                 }
                             }
                         }
                     },
-                    "outputs": {
-                        "enabled": True,
-                        "artifacts_storages": [common.resolve_artifact_config(cluster)],
-                    },
                 },
                 wait_for_validation=True,
                 max_wait_time=(60 * 60),
             )
-        except jetclient.clients.gitlab.GitlabAPIError as e:
+        except (
+            jetclient.clients.gitlab.GitlabAPIError,
+            jetclient.facades.objects.util.WaitTimeExceeded,
+        ) as e:
             logger.error(f"Faced {str(e)}. Waiting and retrying...")
             n_submission_attempts += 1
             time.sleep(2**n_submission_attempts * 5)
@@ -138,9 +222,19 @@ def launch_and_wait_for_completion(
         pipeline.jet_id,
     )
 
-    pipeline.wait(max_wait_time=60 * 60 * 24 * 7, interval=60 * 1, retries_on_error=3)
+    try:
+        status = wait_for_pipeline_completion(pipeline)
+        logger.info(f"Pipeline terminated; status: {status}")
+    except jetclient.facades.objects.util.WaitTimeExceeded:
+        logger.error(
+            "Pipeline %s exceeded the wall-clock budget; cancelling so the iteration retries.",
+            pipeline.jet_id,
+        )
+        try:
+            pipeline.cancel()
+        except jetclient.clients.gitlab.GitlabAPIError:
+            logger.exception("Failed to cancel pipeline %s", pipeline.jet_id)
 
-    logger.info(f"Pipeline terminated; status: {pipeline.get_status()}")
     return pipeline
 
 
@@ -166,65 +260,52 @@ def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> Optio
     return assets_base_path
 
 
-def extract_torchrunlogs_to_string(logs_path: pathlib.Path) -> Dict[int, List[str]]:
-    logs_dict = {}
+def iter_torchrun_logs(logs_path: pathlib.Path) -> Iterator[str]:
+    """Yield the content of every per-rank stdout/stderr log, one file at a time.
 
+    The per-rank logs of a single job can add up to hundreds of MB (e.g. one warning line per
+    CUDA-graph capture and generator). Holding all of them in memory at once, as lists of lines
+    plus their concatenation, got this launcher OOM-killed on the GitLab runner (exit code 137)
+    after the JET pipeline itself had already succeeded. Stream them instead.
+    """
     # Iterate through all restart folders
-    for restart_dir in logs_path.glob("restart=*"):
-        # Find all stdout.log files
-        for stdout_file in restart_dir.glob("assets/basic/*/logs/*/*/attempt_0/*/std*.log"):
-            # Extract rank from path
-            rank = int(stdout_file.parent.name)
-
-            # Read log file
+    for restart_dir in sorted(logs_path.glob("restart=*")):
+        # Find all stdout.log / stderr.log files
+        for log_file in sorted(restart_dir.glob("assets/basic/*/logs/*/*/attempt_0/*/std*.log")):
             try:
-                with open(stdout_file) as f:
-                    log_content = f.readlines()
-                    if rank not in logs_dict:
-                        logs_dict[rank] = log_content
-                    else:
-                        logs_dict[rank] += log_content
+                with open(log_file, errors="replace") as f:
+                    yield f.read()
             except Exception as e:
-                logger.error(f"Error reading log file {stdout_file}: {e}")
+                logger.error(f"Error reading log file {log_file}: {e}")
                 continue
-    return logs_dict
 
 
-def extract_main_log_to_string(logs_path: pathlib.Path) -> List[str]:
+def any_torchrun_log_matches(logs_path: pathlib.Path, predicate: Callable[[str], bool]) -> bool:
+    """True if `predicate` holds for the content of at least one per-rank log file."""
+    return any(predicate(log) for log in iter_torchrun_logs(logs_path))
+
+
+def extract_main_log_to_string(logs_path: pathlib.Path) -> str:
     logs = []
 
     # Iterate through all restart folders
-    for restart_dir in logs_path.glob("restart=*"):
+    for restart_dir in sorted(logs_path.glob("restart=*")):
         # Find all stdout.log files
         for stdout_file in restart_dir.glob(
             "assets/basic/*/jet_assets/output_logs/output_script-0.log"
         ):
-
             # Read log file
             try:
-                with open(stdout_file) as f:
-                    log_content = f.readlines()
-                    logs += log_content
+                with open(stdout_file, errors="replace") as f:
+                    logs.append(f.read())
             except Exception as e:
                 logger.error(f"Error reading log file {stdout_file}: {e}")
                 continue
-    return logs
+    return "".join(logs)
 
 
-def parse_failed_job(logs: List[str]) -> Optional[bool]:
-    for log_row in logs[::-1]:
-        match = re.search(r"Job finished with status 'FAILED'", log_row)
-        if match is not None:
-            return True
-    return False
-
-
-def parse_finished_training(logs: List[str]) -> Optional[bool]:
-    for log_row in logs[::-1]:
-        match = re.search(r"after training is done", log_row)
-        if match is not None:
-            return True
-    return False
+def parse_failed_job(log: str) -> bool:
+    return "Job finished with status 'FAILED'" in log
 
 
 def telemetrics_and_exit(
@@ -239,8 +320,8 @@ def telemetrics_and_exit(
                 "environment": environment,
                 "is_integration_test": is_integration_test,
                 "duration_seconds": (
-                    pd.Timestamp.now(tz='UTC')
-                    - pd.Timestamp(os.getenv("CI_JOB_STARTED_AT"), tz='UTC')
+                    pd.Timestamp.now(tz="UTC")
+                    - pd.Timestamp(os.getenv("CI_JOB_STARTED_AT"), tz="UTC")
                 ).total_seconds(),
                 "is_merge_request": os.getenv("CI_MERGE_REQUEST_IID") is not None,
                 "ci_merge_request_iid": os.getenv("CI_MERGE_REQUEST_IID"),
@@ -253,24 +334,53 @@ def telemetrics_and_exit(
         logger.info("No dashboard endpoint found, skipping telemetrics")
         return
 
-    res = requests.post(
-        DASHBOARD_ENDPOINT,
-        data=payload,
-        headers={'Content-Type': 'application/json', 'Accept-Charset': 'UTF-8'},
-    )
-
-    if not res.ok:
-        raise requests.exceptions.HTTPError(
-            f"Failed to make POST request. Received response: {res.status_code}"
+    try:
+        res = requests.post(
+            DASHBOARD_ENDPOINT,
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept-Charset": "UTF-8"},
         )
+        if not res.ok:
+            logger.warning(f"Failed to make POST request. Received response: {res.status_code}")
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to post telemetry: {e}")
     sys.exit(int(not success))
+
+
+def is_flaky_failure(concat_allranks_logs: str) -> bool:
+    return (
+        "The server socket has failed to listen on any local network address."
+        in concat_allranks_logs
+        or "Some NCCL operations have failed or timed out." in concat_allranks_logs
+        or "uncorrectable ECC error encountered" in concat_allranks_logs
+        or "illegal memory access" in concat_allranks_logs
+        or "illegal instruction" in concat_allranks_logs
+        or "torch.distributed.DistNetworkError" in concat_allranks_logs
+        or "Segmentation fault" in concat_allranks_logs
+        or "found NaN in" in concat_allranks_logs
+        or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
+        or "double free or corruption" in concat_allranks_logs
+        or "Call to CUDA function failed." in concat_allranks_logs
+        or "Connection reset by peer" in concat_allranks_logs
+        or "invalid pointer" in concat_allranks_logs
+        or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
+        or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
+        or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
+        or "Unpack failed: incomplete input" in concat_allranks_logs
+        or "unspecified launch failure" in concat_allranks_logs
+        or "free(): corrupted unsorted chunks" in concat_allranks_logs
+        or "Segfault encountered" in concat_allranks_logs
+        or "Fatal glibc error" in concat_allranks_logs
+        or "Disk quota exceeded" in concat_allranks_logs
+        or "basic_ios::clear: iostream error" in concat_allranks_logs
+    )
 
 
 @click.command()
 @click.option("--model", required=True, type=str, help="Model")
 @click.option("--test-case", required=True, type=str, help="Test case")
 @click.option(
-    "--environment", required=True, type=click.Choice(['dev', 'lts']), help="Pytorch LTS or DEV"
+    "--environment", required=True, type=click.Choice(["dev", "lts"]), help="Pytorch LTS or DEV"
 )
 @click.option("--n-repeat", required=False, default=1, type=int)
 @click.option("--time-limit", required=False, default=1800, type=int)
@@ -327,7 +437,7 @@ def main(
     enable_lightweight_mode: bool = False,
 ):
     logging.basicConfig(level=logging.INFO)
-    logger.info('Started')
+    logger.info("Started")
 
     model_config_path = pathlib.Path(
         BASE_PATH
@@ -347,11 +457,11 @@ def main(
             except yaml.YAMLError as exc:
                 print(exc)
 
-        test_type = test_case_dict['TEST_TYPE']
+        test_type = test_case_dict["TEST_TYPE"]
     else:
         test_type = "unit_test"
 
-    logger.info('test_type will be %s', test_type)
+    logger.info("test_type will be %s", test_type)
 
     if test_type == "release" and (run_name is None or wandb_experiment is None):
         logger.error(f"Not all arguments provided ({run_name=}, {wandb_experiment=})")
@@ -360,7 +470,7 @@ def main(
     n_attempts = 0
     n_nondeterminism_attemps = 0
     n_iteration = 0
-    while True and n_attempts < 3 and n_nondeterminism_attemps < 2:
+    while True and n_attempts < 9 and n_nondeterminism_attemps < 3:
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
             environment=environment,
@@ -387,9 +497,12 @@ def main(
                 jet_log = main_job.get_logs()
                 assets_base_path = download_job_assets(logs=jet_log, iteration=n_iteration)
                 if assets_base_path is None:
+                    no_log = True
                     break
-                allranks_logs = extract_torchrunlogs_to_string(logs_path=assets_base_path)
-                mainrank_log = extract_main_log_to_string(logs_path=assets_base_path)
+                has_rank_logs = any_torchrun_log_matches(
+                    assets_base_path, lambda log: log.strip() != ""
+                )
+                concat_mainrank_log = extract_main_log_to_string(logs_path=assets_base_path)
                 no_log = False
                 break
             except (
@@ -402,21 +515,20 @@ def main(
                 time.sleep(2 * n_download_attempt * 15)
                 n_download_attempt += 1
                 no_log = True
-            except (KeyError, IndexError) as e:
+            except Exception as e:
                 logger.error(e)
                 no_log = True
+                n_download_attempt += 1
                 break
+
+            n_download_attempt += 1
 
         if no_log:
             logger.error("Did not find any logs to download, retry.")
             n_attempts += 1
             continue
 
-        concat_allranks_logs = "\n".join(
-            ["\n".join(log_lines) for log_lines in allranks_logs.values()]
-        )
-        concat_mainrank_log = "\n".join(mainrank_log)
-        if concat_allranks_logs.strip() == "":
+        if not has_rank_logs and concat_mainrank_log.strip() == "":
             logger.error("No logs found. Try again.")
             n_attempts += 1
             continue
@@ -442,11 +554,8 @@ def main(
         logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
-            if (
-                "The server socket has failed to listen on any local network address."
-                in concat_allranks_logs
-            ):
-                logger.error("TCP error, attempt restart.")
+            if not success and any_torchrun_log_matches(assets_base_path, is_flaky_failure):
+                logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
 
@@ -462,23 +571,19 @@ def main(
                     is_integration_test=enable_lightweight_mode,
                 )
 
-            if (
-                "The server socket has failed to listen on any local network address."
-                in concat_allranks_logs
-                or "Some NCCL operations have failed or timed out." in concat_allranks_logs
-                or "uncorrectable ECC error encountered" in concat_allranks_logs
-                or "illegal memory access" in concat_allranks_logs
-                or "illegal instruction" in concat_allranks_logs
-                or "torch.distributed.DistNetworkError" in concat_allranks_logs
-                or "Segmentation fault" in concat_allranks_logs
-            ):
-                logger.error("Detected NCCL failure, attempt restart.")
+            if any_torchrun_log_matches(assets_base_path, is_flaky_failure):
+                if n_attempts < 9:
+                    logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
 
-            if "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log:
-                logger.error("Non-determinism, let's try another node.")
+            if (
+                "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log
+                or "Throughput is slower than expected!" in concat_mainrank_log
+            ) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
                 n_nondeterminism_attemps += 1
+                if n_nondeterminism_attemps < 3:
+                    logger.error("Non-determinism, let's try another node.")
                 continue
 
             telemetrics_and_exit(
@@ -489,13 +594,24 @@ def main(
                 is_integration_test=enable_lightweight_mode,
             )
 
-        if parse_failed_job(logs=mainrank_log):
-            n_attempts += 1
-            continue
+        if test_type == "release":
+            if any_torchrun_log_matches(
+                assets_base_path,
+                lambda log: (
+                    "StopIteration" in log
+                    or "after training is done" in log
+                    or "exiting program at iteration" in log
+                ),
+            ):
+                logger.info("Release training finished")
+                sys.exit(int(not success))  # invert for exit 0
 
-        if parse_finished_training(logs=mainrank_log):
-            sys.exit(int(not success))  # invert for exit 0
-        n_iteration += 1
+            if not success or parse_failed_job(concat_mainrank_log):
+                logger.error("Release pipeline finished with status %s, retrying.", status.name)
+                n_attempts += 1
+                continue
+
+            n_iteration += 1
 
     telemetrics_and_exit(
         success=False,

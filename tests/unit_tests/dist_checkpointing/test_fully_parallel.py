@@ -27,16 +27,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
     is_main_replica,
 )
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
-from megatron.core.dist_checkpointing.strategies.base import (
-    LoadShardedStrategy,
-    SaveShardedStrategy,
-    StrategyAction,
-    get_default_strategy,
-)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
@@ -44,13 +34,15 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 )
 from megatron.core.dist_checkpointing.strategies.torch import (
     MCoreLoadPlanner,
+    TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
 )
+from megatron.core.utils import get_pg_rank
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
-class MockSaveStrategy(SaveShardedStrategy):
+class MockSaveStrategy(TorchDistSaveShardedStrategy):
     def __init__(self):
         super().__init__('mock', 1)
         self.save_keys = set()
@@ -61,13 +53,13 @@ class MockSaveStrategy(SaveShardedStrategy):
                 self.save_keys.add(sh_ten.key)
 
 
-class MockLoadStrategy(LoadShardedStrategy):
+class MockLoadStrategy(TorchDistLoadShardedStrategy):
     def __init__(self, device='cpu'):
         super().__init__()
         self.device = device
         self.load_keys = set()
 
-    def load(self, sharded_state_dict, ckpt_dir):
+    def load(self, sharded_state_dict, ckpt_dir, async_strategy="nvrx"):
         for sh_ten in nested_values(sharded_state_dict):
             if is_main_replica(sh_ten.replica_id):
                 self.load_keys.add(sh_ten.key)
@@ -190,9 +182,9 @@ class TestFullyParallelSaveAndLoad:
         parallelization_group = (
             parallel_state.get_data_parallel_group(with_context_parallel=True)
             if parallelization_along_dp
-            else None
+            else torch.distributed.group.WORLD
         )
-        dp_rank = torch.distributed.get_rank(parallelization_group)
+        dp_rank = get_pg_rank(parallelization_group)
         expected_keys_saved_by_current_rank = {
             k for k, v in expected_key_to_saving_ranks.items() if dp_rank in v
         }
@@ -297,9 +289,9 @@ class TestFullyParallelSaveAndLoad:
         parallelization_group = (
             parallel_state.get_data_parallel_group(with_context_parallel=True)
             if parallelize_within_dp
-            else None
+            else torch.distributed.group.WORLD
         )
-        dp_rank = torch.distributed.get_rank(parallelization_group)
+        dp_rank = get_pg_rank(parallelization_group)
         expected_keys_loaded_by_current_rank = {
             k for k, v in expected_key_to_loading_ranks.items() if dp_rank in v
         }
@@ -362,10 +354,13 @@ class TestFullyParallelSaveAndLoad:
 
         mem_alloc_start = torch.cuda.memory_allocated()
 
-        with mock.patch(
-            'megatron.core.dist_checkpointing.exchange_utils._get_empty_tensor_for_exchange',
-            new=mock_get_empty_tensor_for_exchange,
-        ), TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A:
+        with (
+            mock.patch(
+                'megatron.core.dist_checkpointing.exchange_utils._get_empty_tensor_for_exchange',
+                new=mock_get_empty_tensor_for_exchange,
+            ),
+            TempNamedDir(tmp_path_dist_ckpt / 'mock_dir') as ckpt_dir_A,
+        ):
             _ = load_strategy.load(sharded_state_dict, ckpt_dir_A)
 
         # Each rank is expected to do 9 allocations for all shards loaded by some other rank.
@@ -429,6 +424,7 @@ class TestFullyParallelSaveAndLoad:
         Utils.destroy_model_parallel()
 
     def test_broadcast_sharded_objects(self, tmp_path_dist_ckpt):
+        Utils.initialize_distributed()
 
         sharded_state_dict = {
             f'Obj_{i}': ShardedObject(f'Obj_{i}', None, (1,), (0,), replica_id=abs(Utils.rank - i))
@@ -580,17 +576,19 @@ class TestCrossRanksReads:
     ):
         Utils.initialize_model_parallel(tp_size, 1)
         parallelization_group = (
-            parallel_state.get_data_parallel_group() if parallel_within_dp else None
+            parallel_state.get_data_parallel_group()
+            if parallel_within_dp
+            else torch.distributed.group.WORLD
         )
         state_dict = self.get_sharded_state_dict(ranks_placement)
         with TempNamedDir(tmp_path_dist_ckpt / 'determine_cross_rank_reads') as ckpt_dir:
             save_strategy = FullyParallelSaveStrategyWrapper(
-                get_default_save_sharded_strategy(), parallelization_group
+                TorchDistSaveShardedStrategy(), parallelization_group
             )
             save_strategy.save(state_dict, ckpt_dir)
 
             load_strategy = FullyParallelLoadStrategyWrapper(
-                get_default_strategy(StrategyAction.LOAD_SHARDED, 'torch_dist', 1),
+                TorchDistLoadShardedStrategy(),
                 parallelization_group,
                 do_cache_distribution=True,
                 exchange_algo='broadcast',

@@ -1,12 +1,34 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import pathlib
 from typing import Optional
 
 import click
 import yaml
 
-from tests.test_utils.python_scripts import common
+from tests.test_utils.python_scripts import recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
+TRIAGE_LOG_PATH = "jet_workload.log"
+TRIAGE_REPORT_PATH = "error_report.json"
+
+
+def build_test_script(command: str) -> str:
+    """Wrap a workload command with non-blocking error extraction."""
+    return "\n".join(
+        [
+            "set +e",
+            "set -o pipefail",
+            f"{command} 2>&1 | tee {TRIAGE_LOG_PATH}",
+            'exit_code=${PIPESTATUS[0]}',
+            "set -e",
+            (
+                f"extract-errors {TRIAGE_LOG_PATH} --output {TRIAGE_REPORT_PATH} "
+                '--exit-code "$exit_code" || true'
+            ),
+            'exit "$exit_code"',
+        ]
+    )
 
 
 @click.command()
@@ -58,6 +80,21 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
     type=bool,
     help="Run one job as dependency to others as to warm up cache",
 )
+@click.option(
+    "--cadence",
+    required=False,
+    type=str,
+    default=None,
+    help=(
+        "Trigger cadence to filter tests by (pr|nightly|mergegroup). "
+        "Empty/unset disables the cadence filter."
+    ),
+)
+@click.option(
+    "--enable-error-extraction/--no-enable-error-extraction",
+    default=False,
+    help="Extract a structured error report from GitLab child-job output.",
+)
 def main(
     scope: str,
     environment: str,
@@ -78,16 +115,25 @@ def main(
     wandb_experiment: Optional[str] = None,
     enable_lightweight_mode: bool = False,
     enable_warmup: Optional[bool] = None,
-):
+    cadence: Optional[str] = None,
+    enable_error_extraction: bool = False,
+) -> None:
+    # Treat empty string as "no cadence filter" so callers can wire shell
+    # variables in directly without conditional flag emission.
+    cadence_arg = cadence or None
+    job_timeout = "24 hours" if platform == "dgx_gb300" else "7 days"
+
     list_of_test_cases = [
         test_case
-        for test_case in common.load_workloads(
+        for test_case in recipe_parser.load_workloads(
             scope=scope,
             container_tag=container_tag,
             environment=environment,
             test_cases=test_cases,
             platform=platform,
             tag=tag,
+            cadence=cadence_arg,
+            time_limit=time_limit,
         )
         if test_case.type != "build"
     ]
@@ -115,23 +161,33 @@ def main(
                 "stage": "empty-pipeline-placeholder",
                 "image": f"{container_image}:{container_tag}",
                 "tags": tags,
-                "timeout": "7 days",
+                "timeout": job_timeout,
                 "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}],
                 "script": ["sleep 1"],
                 "artifacts": {"paths": ["results/"], "when": "always"},
+                "retry": {
+                    "max": 2,
+                    "when": [
+                        "unknown_failure",
+                        "stuck_or_timeout_failure",
+                        "runner_system_failure",
+                    ],
+                },
             },
         }
 
     else:
-        list_of_test_cases = sorted(list_of_test_cases, key=lambda x: x.spec.model)
+        list_of_test_cases = sorted(list_of_test_cases, key=lambda x: x["spec"]["model"])
 
         gitlab_pipeline = {
-            "stages": sorted(list(set([test_case.spec.model for test_case in list_of_test_cases]))),
+            "stages": sorted(
+                list(set([test_case["spec"]["model"] for test_case in list_of_test_cases]))
+            ),
             "workflow": {
                 "rules": [
                     {
                         "if": '($CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID) && $CI_COMMIT_BRANCH == "main"',
-                        "auto_cancel": {"on_new_commit": "none"},
+                        "auto_cancel": {"on_new_commit": "interruptible"},
                     },
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID'},
                     {"when": "never"},
@@ -148,17 +204,19 @@ def main(
 
         for test_idx, test_case in enumerate(list_of_test_cases):
             job_tags = list(tags)
-            job_tags.append(f"cluster/{common.resolve_cluster_config(cluster)}")
+            # JHB has no cluster-tagged submission runner; JET selects its GPU runner.
+            if cluster != "dgxgb300_oci-jhb":
+                job_tags.append(f"cluster/{recipe_parser.resolve_cluster_config(cluster)}")
 
             script = [
                 "export PYTHONPATH=$(pwd); "
                 "python tests/test_utils/python_scripts/launch_jet_workload.py",
-                f"--model {test_case.spec.model}",
-                f"--environment {test_case.spec.environment}",
+                f"--model {test_case['spec']['model']}",
+                f"--environment {test_case['spec']['environment']}",
                 f"--n-repeat {n_repeat}",
-                f"--time-limit {time_limit}",
+                f"--time-limit {test_case['spec'].get('time_limit', time_limit)}",
                 f"--scope {scope}",
-                f"--test-case '{test_case.spec.test_case}'",
+                f"--test-case '{test_case['spec']['test_case']}'",
                 f"--container-tag {container_tag}",
                 f"--cluster {cluster}",
                 f"--platform {platform}",
@@ -177,27 +235,42 @@ def main(
 
             if run_name is not None and wandb_experiment is not None:
                 script.append(f"--run-name {run_name}")
-                test_case.spec.model
                 script.append(
-                    f"--wandb-experiment {wandb_experiment}-{test_case.spec.model}-{test_case.spec.test_case}"
+                    f"--wandb-experiment {wandb_experiment}-{test_case['spec']['model']}-{test_case['spec']['test_case']}"
                 )
 
             needs = [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}]
 
             if enable_warmup:
                 if test_idx == 0:
-                    warmup_job = test_case.spec.test_case
+                    warmup_job = test_case['spec']['test_case']
                 elif warmup_job != "":
                     needs.append({"job": warmup_job})
 
-            gitlab_pipeline[test_case.spec.test_case] = {
-                "stage": f"{test_case.spec.model}",
+            test_script = " ".join(script)
+            artifact_paths = ["results/"]
+            if enable_error_extraction:
+                test_script = build_test_script(test_script)
+                artifact_paths.extend([TRIAGE_LOG_PATH, TRIAGE_REPORT_PATH])
+
+            gitlab_pipeline[test_case['spec']['test_case']] = {
+                "stage": f"{test_case['spec']['model']}",
                 "image": f"{container_image}:{container_tag}",
                 "tags": job_tags,
-                "timeout": "7 days",
+                "timeout": job_timeout,
                 "needs": needs,
-                "script": [" ".join(script)],
-                "artifacts": {"paths": ["results/"], "when": "always"},
+                "script": [test_script],
+                "artifacts": {"paths": artifact_paths, "when": "always"},
+                "allow_failure": test_case["spec"].get("allow_failure", False)
+                or test_case["spec"]["model"] == "gpt-nemo",
+                "retry": {
+                    "max": 2,
+                    "when": [
+                        "unknown_failure",
+                        "stuck_or_timeout_failure",
+                        "runner_system_failure",
+                    ],
+                },
             }
 
     with open(output_path, 'w') as outfile:

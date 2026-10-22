@@ -9,11 +9,11 @@ Data preprocessing is built around the following classes:
 
 At the moment, an end-to-end data preprocessing implementation is left to the user. See the class docstring(s) for more details.
 
-#### IndexedDatasetBuilder
+### IndexedDatasetBuilder
 
 The `IndexedDatasetBuilder` is capable of building and merging `IndexedDataset` instances.
 
-#### IndexedDataset
+### IndexedDataset
 
 The `IndexedDataset` class is the lowest-level data interface in Megatron Core. Internally, an `IndexedDataset` instance references two binaries: the data file (`.bin`) contains document/sequence data and the index file (`.idx`) contains document/sequence metadata.
 
@@ -42,32 +42,32 @@ Building the data loaders is a distributed-aware process built around the follow
 
 See the class docstrings for more details.
 
-#### BlendedMegatronDatasetConfig (extendable)
+### BlendedMegatronDatasetConfig (extendable)
 
 The `BlendedMegatronDatasetConfig` class parameterizes the `BlendedMegatronDatasetBuilder` and in turn the `MegatronDataset` and `BlendedDataset`.
 
 Different training/inference regimes will require different extensions e.g. the `GPTDatasetConfig`
 
-#### BlendedMegatronDatasetBuilder
+### BlendedMegatronDatasetBuilder
 
 The `BlendedMegatronDatasetBuilder` class builds the highest-level data interfaces in Megatron Core.
 
 **NB:** All ranks should attempt to build the dataset via the `BlendedMegatronDatasetBuilder` or the program will hang. Which ranks follow through on their attempts can be controlled via the `BlendedMegatronDatasetConfig`.
 
-#### IndexedDataset
+### IndexedDataset
 
 The `IndexedDataset` class is the lowest-level data interface in Megatron Core.
 
 The `IndexedDataset` should already exist on disk before attempting to build any of the high-level data interfaces.
 
 
-#### MegatronDataset (extendable)
+### MegatronDataset (extendable)
 
 The `MegatronDataset` abstract class is a high-level data interface in Megatron Core. It is an abstraction built upon the `IndexedDataset`.
 
 Different training/inference regimes will require different extensions e.g. the `GPTDataset`
 
-#### BlendedDataset
+### BlendedDataset
 
 The `BlendedDataset` class is a high-level data interface in Megatron Core. It is an abstraction built upon the `MegatronDataset`.
 
@@ -191,3 +191,47 @@ To query the `BlendedDataset` for the _k_-th sample we do the following
     ```
 
 To save time during initialization, each index is built/cached sequentially on one process rank and subsequently loaded in parallel on other process ranks. The cached indices are unique to a hash generated in the `BlendedDataset.__init__` function.
+
+## Offline cache preparation
+
+For GPT-style training, the dataset caches described above can be prepared ahead of time with `tools/prepare_cache.py` instead of waiting for rank 0 to build them during training startup.
+
+The script reuses the normal dataset construction path used by `pretrain_gpt.py` and `pretrain_mamba.py`, including `GPTDataset`, `BlendedDataset`, and `BlendedMegatronDatasetBuilder`. It accepts the usual dataset arguments, supports blends and per-split dataset definitions, and requires `--data-cache-path` so the generated cache can later be reused by training.
+
+This is especially useful for large blends or many file prefixes, where building the document, sample, and shuffle indices can take several minutes and leave all GPUs idle while rank 0 performs CPU-only work.
+
+If the later training job does not specify `--global-batch-size` (which is needed to determine the dataset size and splits), you should specify `--prepare-cache-world-size` to explicitly set the world size used during cache preparation.
+
+`tools/prepare_cache.py` does not support `--mock-data`, `--sft`, `--fim-data`, or `--step-batch-size-schedule`.
+
+## Packing Scheduler
+
+The packing scheduler re-schedules variable-length sequences across DP×CP ranks to improve GPU utilization. It is built around the following modules:
+
+### `data_schedule`
+
+This module contains the high-level scheduling logic and entry points:
+
+- **`HybridCPDataLoaderWrapper`**: A wrapper class for hybrid context parallel (CP) scheduling. For every `__next__` call, it: (1) pulls a batch of packed samples from each DP rank, (2) gathers sequence lengths across the DP group, (3) schedules sub-samples using the `BalancedCPScheduler`, (4) reroutes sub-samples to the correct DPxCP ranks via all-to-all communication.
+
+- **`BasePackingScheduler`**: Abstract base class for packing schedulers. Defines the interface for `get_groups_and_subsamples()` (scheduling algorithm) and `run()` (full scheduling pipeline including fetch, schedule, reroute, pack, broadcast, and VPP handling).
+
+- **`DpBalancedScheduler`**: A concrete scheduler that packs sequences in their original order until reaching the max sequence length limit per DPxCP rank. Supports aligning the number of microbatches to DP size and VPP stage multiples.
+
+- **`wrap_data_iterator()`**: Top-level entry point that wraps an existing `data_iterator`. It creates the appropriate scheduler, runs the scheduling pipeline, broadcast metadata and new num_microbatches, returns a new data iterator along with the updated number of microbatches and FLOPs statistics.
+
+- **`get_batch_on_this_rank_for_sequence_packing()`**: Fetches and broadcasts a single packed microbatch for the current rank. Handles TP/PP broadcasting, constructs `PackedSeqParams` (with `cu_seqlens`, `max_seqlen`, `qkv_format=thd`), and optionally partitions sequences across CP ranks using Transformer Engine's `thd_get_partitioned_indices`.
+
+### `data_schedule_utils.py`
+
+This module contains the utility functions used by the schedulers.
+
+## Fast DataLoader initialization
+
+Especially for large-scale runs, DataLoader initialization can take several minutes, since it involves opening and memory-mapping multiple files and can significantly stress the filesystem. To speed up this process, we have developed the following three optimizations, controlled by configuration flags:
+
+  - `--dataloader-fast-cache-load`: This option assumes that the dataset cache already exists in the specified `--data-cache-path`. When enabled, it speeds up the creation process by removing synchronization points and file check assertions.
+
+  - `--dataloader-defer-npy-index-mmap`: This option also assumes that the dataset cache already exists in the specified `--data-cache-path`. When enabled, it defers the memory mapping of the dataset indexes (.npy files) until their first access. We recommend using this configuration together with `--num-workers` > 0 so that the DataLoader prefetches the next batches of data, thereby hiding the cost of index memory mapping.
+
+  - `--per-dataset-sequences-path`: With this configuration, we specify the JSON file generated by the `tools/build_sequences_per_dataset.py` script. This script generates a single file containing the required metadata from all the specified file prefixes. This configuration is especially useful when dealing with hundreds to thousands of file prefixes, since it requires only a single `open` operation instead of one per file prefix.

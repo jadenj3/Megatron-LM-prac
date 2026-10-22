@@ -25,7 +25,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, internal_api
 
 logger = logging.getLogger(__name__)
 
@@ -142,19 +142,21 @@ class RotaryEmbedding(nn.Module):
     def get_cos_sin(self, max_seq_len: int, offset: int = 0) -> (Tensor, Tensor):
         """Cosine and sine values for RoPE are precomputed for all positions up to the maximum
         sequence length"""
+        if self.inv_freq.device.type == 'cpu':
+            # Match get_emb(): CPU initialization defers this persistent tensor's
+            # device transfer until its first inference forward.
+            self.inv_freq = self.inv_freq.to(device=torch.cuda.current_device())
         freqs = self.get_freqs_non_repeated(max_seq_len, offset)
         cos = torch.cos(freqs)
         sin = torch.sin(freqs)
         return cos, sin
 
-    @lru_cache(maxsize=32)
-    def forward(self, max_seq_len: int, offset: int = 0, packed_seq: bool = False) -> Tensor:
-        """Forward pass of RoPE embedding.
+    def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
+        """Forward pass of RoPE embedding before CP sharding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
-            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -174,11 +176,79 @@ class RotaryEmbedding(nn.Module):
             )
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
-        if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension and select the parition of the current
-            # CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
         return emb
+
+    @lru_cache(maxsize=32)
+    @internal_api
+    def forward(
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq: bool = False,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Tensor:
+        """Forward pass of RoPE embedding.
+
+        Args:
+            max_seq_len (int): Maximum size of sequence
+            offset (int, optional): RoPE offset. Defaults to 0.
+            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
+                Defaults to None.
+
+        Returns:
+            Tensor: Embeddings after applying RoPE.
+        """
+        emb = self.get_emb(max_seq_len, offset)
+        if cp_group is None:
+            cp_group = self.cp_group
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
+            # slice rotary_pos_emb along sequence dimension
+            # and select the parition of the current CP rank
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+
+        return emb
+
+    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False, cp_group=None):
+        """Materialize cached cos/sin tensors for ``[seq_len, ..., dim]``."""
+        self.max_seq_len_cached = seq_len
+        self.offset_cached = offset
+        self.dtype_cached = dtype
+        self.packed_seq_cached = packed_seq
+
+        emb = self.forward(seq_len, offset, packed_seq=packed_seq, cp_group=cp_group)
+        self.register_buffer("cos_cached", emb.cos().to(dtype).contiguous(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype).contiguous(), persistent=False)
+
+    def get_cached_cos_sin(
+        self,
+        seq_len,
+        offset=0,
+        dtype=torch.get_default_dtype(),
+        packed_seq=False,
+        cp_group=None,
+        mscale=None,
+    ):
+        """Get cached cos and sin values.
+
+        The cache is rebuilt on first use or whenever ``seq_len`` grows
+        beyond the cached length, or any of ``offset`` / ``dtype`` /
+        ``packed_seq`` changes from the previous call.
+        ``YarnRotaryEmbedding`` overrides this to also bake its
+        concentration factor into the cached cos/sin (controlled by
+        ``mscale``); for the base class without a concentration
+        factor the argument is accepted-and-ignored for API uniformity.
+        """
+        del mscale  # base class has no concentration factor
+        if (
+            not hasattr(self, "max_seq_len_cached")
+            or seq_len > self.max_seq_len_cached
+            or offset != self.offset_cached
+            or dtype != self.dtype_cached
+            or packed_seq != self.packed_seq_cached
+        ):
+            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group)
+        return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         state_dict.pop(f'{prefix}inv_freq', None)
@@ -190,10 +260,10 @@ class RotaryEmbedding(nn.Module):
         transformer: TransformerBlock,
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
-        packed_seq_params: PackedSeqParams,
+        packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> float:
+    ) -> int:
         """Function to get the rotary sequence length.
 
         Args:
@@ -205,7 +275,7 @@ class RotaryEmbedding(nn.Module):
             packed_seq_params (PackedSeqParams): Packed sequence params
 
         Returns:
-            float: The rotary sequence length
+            int: The rotary sequence length
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -215,7 +285,15 @@ class RotaryEmbedding(nn.Module):
             # by the tp and cp size.
             return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
         elif inference_context is not None:
-            rotary_seq_len = inference_context.max_sequence_length
+            # For dynamic batching, use the max of context's max_sequence_length and the actual
+            # input size to ensure rotary embeddings cover CUDA graph warmup token counts
+            context_max_seq_len = inference_context.max_sequence_length
+            input_seq_len = 0
+            if transformer_input is not None:
+                input_seq_len = transformer_input.size(0)
+            elif transformer is not None and transformer.input_tensor is not None:
+                input_seq_len = transformer.input_tensor.size(0)
+            rotary_seq_len = max(context_max_seq_len, input_seq_len)
         else:
             if transformer is not None and transformer.input_tensor is not None:
                 rotary_seq_len = transformer.input_tensor.size(0)
@@ -256,6 +334,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         rotary_interleaved: bool = False,
         seq_len_interpolation_factor: Optional[float] = None,
         rotary_base: int = 10000,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         super().__init__()
 
@@ -272,14 +351,26 @@ class MultimodalRotaryEmbedding(nn.Module):
                 / dim
             )
         )
+        self.cp_group = (
+            cp_group
+            if cp_group is not None
+            else parallel_state.get_context_parallel_group(check_initialized=False)
+        )
 
-    def forward(self, position_ids: torch.Tensor, mrope_section: List[int]) -> Tensor:
+    def forward(
+        self,
+        position_ids: torch.Tensor,
+        mrope_section: List[int],
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
         Args:
             position_ids (torch.Tensor): A postion_id tensor with shape [3, batchsize, seqlens]
             mrope_section (list[int]): Multimodal rope section is for channel dimension of temporal,
                 height and width in rope calculation.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
+                Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -312,8 +403,10 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
-        if parallel_state.get_context_parallel_world_size() > 1:
+        if cp_group is None:
+            cp_group = self.cp_group
+        if cp_group is not None and cp_group.size() > 1:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 1)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb

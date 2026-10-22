@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 @click.option(
     "--is-convergence-test/--is-normal-test",
     type=bool,
-    help="Tensorboard index to extract",
+    help="Use first or all tensorboard logs",
     default=False,
 )
 @click.option("--step-size", required=False, default=5, type=int, help="Step size of sampling")
@@ -28,7 +29,7 @@ def collect_train_test_metrics(
 ):
     summaries = common.read_tb_logs_as_list(
         logs_dir,
-        index=(0 if not is_convergence_test else -1),
+        index=(-1 if is_convergence_test else 0),
         train_iters=train_iters,
         start_idx=1,
         step_size=step_size,
@@ -48,18 +49,23 @@ def collect_train_test_metrics(
             "mem-max-allocated-bytes",
             "lm loss",
             "num-zeros",
+            "mtp_1 loss",
+            "mtp_2 loss",
+            "total loss",
         ]
     }
 
     if output_path is not None:
+        serialized_summaries = json.dumps(
+            {
+                golden_value_key: golden_values.model_dump()
+                for golden_value_key, golden_values in summaries.items()
+            },
+            indent=4,
+            allow_nan=False,
+        )
         with open(output_path, "w") as fh:
-            json.dump(
-                {
-                    golden_value_key: golden_values.model_dump()
-                    for golden_value_key, golden_values in summaries.items()
-                },
-                fh,
-            )
+            fh.write(serialized_summaries)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, nvtx_decorator
@@ -24,6 +25,7 @@ class LanguageModelEmbedding(MegatronModule):
         num_tokentypes (int): Set to 0 without binary head, and 2 with a binary head. Defaults to 0.
         scatter_to_sequence_parallel (bool): Set to False to disable scatter of embedding
             across sequence parallel region. Defaults to True.
+        pg_collection (ProcessGroupCollection, optional): Process groups used by the embedding.
     """
 
     def __init__(
@@ -35,6 +37,7 @@ class LanguageModelEmbedding(MegatronModule):
         num_tokentypes: int = 0,
         scatter_to_sequence_parallel: bool = True,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
 
@@ -56,10 +59,11 @@ class LanguageModelEmbedding(MegatronModule):
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
             num_embeddings=self.vocab_size,
             embedding_dim=self.config.hidden_size,
-            init_method=self.config.init_method,
+            init_method=self.config.embedding_init_method,
             reduce_scatter_embeddings=self.reduce_scatter_embeddings,
             config=self.config,
             tp_group=self.tp_group,
+            pg_collection=pg_collection,
         )
 
         # Position embedding (serial).
@@ -70,7 +74,7 @@ class LanguageModelEmbedding(MegatronModule):
 
             # Initialize the position embeddings.
             if self.config.perform_initialization:
-                self.config.init_method(self.position_embeddings.weight)
+                self.config.embedding_init_method(self.position_embeddings.weight)
 
         if self.num_tokentypes > 0:
             self.tokentype_embeddings = torch.nn.Embedding(
@@ -78,7 +82,7 @@ class LanguageModelEmbedding(MegatronModule):
             )
             # Initialize the token-type embeddings.
             if self.config.perform_initialization:
-                self.config.init_method(self.tokentype_embeddings.weight)
+                self.config.embedding_init_method(self.tokentype_embeddings.weight)
         else:
             self.tokentype_embeddings = None
 
@@ -126,6 +130,10 @@ class LanguageModelEmbedding(MegatronModule):
             embeddings = embeddings + tokentype_embedding
         else:
             assert self.tokentype_embeddings is None
+
+        # MuP: scale embeddings by alpha_input.
+        if self.config.use_mup and self.config.mup_embedding_mult != 1.0:
+            embeddings = embeddings * self.config.mup_embedding_mult
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:

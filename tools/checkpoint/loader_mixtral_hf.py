@@ -8,7 +8,7 @@ import transformers
 from tqdm import tqdm
 import types
 
-from tools.checkpoint.utils import _ConverterFakeProcessGroup
+from tools.checkpoint.utils import initialize_checkpoint_converter_fake_process_groups
 
 
 def add_arguments(parser):
@@ -34,7 +34,6 @@ def load_args_from_checkpoint(args):
     args.untie_embeddings_and_output_weights = True
     args.seq_length = 4096
     args.global_batch_size = 1024
-    args.iteration = 1 # '0', 'release' don't work
     args.add_position_embedding = False
     args.use_rotary_position_embeddings = True
     args.swiglu = True
@@ -130,7 +129,8 @@ def set_layer_state(args, model, hf_model, layer_idx):
 def load_checkpoint_to_model(args):
     '''Set model params.'''
 
-    from pretrain_gpt import model_provider
+    from model_provider import model_provider
+    from gpt_builders import gpt_builder
     from transformers import MixtralForCausalLM, MixtralConfig
 
     # Load Huggingface model.
@@ -138,7 +138,7 @@ def load_checkpoint_to_model(args):
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(True, True).to(args.params_dtype)
+    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)
@@ -162,12 +162,12 @@ def _load_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
+        from megatron.training.argument_utils import inference_cfg_container_from_args
         from megatron.training.arguments import parse_args, validate_args
         from megatron.training.global_vars import set_args, set_global_variables
-        from megatron.legacy.model import module
         from megatron.core import mpu
         from megatron.core.enums import ModelType
-        from megatron.legacy import fused_kernels
+        from megatron.core.models.common.language_module.language_module import LanguageModule
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -180,7 +180,6 @@ def _load_checkpoint(queue, args):
                 '--no-masked-softmax-fusion',
                 '--no-bias-gelu-fusion',
                 '--no-bias-dropout-fusion',
-                '--no-async-tensor-model-parallel-allreduce',
                 '--use-cpu-initialization',
                 '--micro-batch-size', '1',
                 '--no-load-optim',
@@ -223,7 +222,6 @@ def _load_checkpoint(queue, args):
     check_for_arg('max_position_embeddings')
     check_for_arg('position_embedding_type')
     check_for_arg('tokenizer_type')
-    check_for_arg('iteration')
     check_for_arg('disable_bias_linear')
     check_for_arg('params_dtype')
     check_for_arg('swiglu')
@@ -233,20 +231,21 @@ def _load_checkpoint(queue, args):
     margs.model_type = ModelType.encoder_or_decoder
 
     # Suppress warning about torch.distributed not being initialized.
-    module.MegatronModule.embedding_warning_printed = True
+    LanguageModule.embedding_warning_printed = True 
 
-    set_global_variables(margs, build_tokenizer=False)
+    cfg = inference_cfg_container_from_args(margs, build_model_config=False)
+    set_global_variables(margs, cfg, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
     
-    # For backward compatibility during local parallel states refactoring
-    fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
-    fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
-    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-    mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
-    fused_kernels.load(margs)
+    initialize_checkpoint_converter_fake_process_groups(
+        mpu,
+        margs.tensor_model_parallel_size,
+        margs.pipeline_model_parallel_size,
+        margs.expert_model_parallel_size,
+    )
 
     # Metadata.
     md = types.SimpleNamespace()
@@ -257,13 +256,14 @@ def _load_checkpoint(queue, args):
     md.num_attention_heads = margs.num_attention_heads
     md.max_position_embeddings = margs.max_position_embeddings
     md.tokenizer_type = margs.tokenizer_type
-    md.iteration = margs.iteration
+    md.iteration = 1
     md.params_dtype = margs.params_dtype
     md.bert_binary_head = margs.bert_binary_head
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embedding_type = margs.position_embedding_type
     md.linear_bias = margs.add_bias_linear
     md.norm_has_bias = False
+    md.qkv_bias = False
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size

@@ -8,18 +8,25 @@ import warnings
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
+import modelopt.torch.quantization as mtq
 import torch
 from datasets import load_dataset
+from modelopt.torch.utils.plugins import megatron_generate
+from utils import get_hf_tokenizer
 
+from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.generate import simple_generate
-from megatron.post_training.model_provider import model_provider
-from megatron.post_training.utils import report_current_memory_info
-from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
-from megatron.training.utils import print_rank_0, unwrap_model
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
+from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import set_run_config
+from megatron.training.utils import print_rank_0
+from model_provider import model_provider
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('once')
 
 
 def add_generate_args(parser):
@@ -29,7 +36,7 @@ def add_generate_args(parser):
     group.add_argument("--draft-length", type=int, default=0, help="Only used in EAGLE.")
     group.add_argument("--draft-topk", type=int, default=1, help="Only used in EAGLE.")
     group.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm.")
-    group.add_argument("--percentage", type=float, default=1.0)
+    group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
 
     add_modelopt_args(parser)
     return parser
@@ -69,18 +76,38 @@ def get_conversations(example):
 
 
 if __name__ == "__main__":
-    initialize_megatron(
-        extra_args_provider=add_generate_args,
-        args_defaults={
+    args = parse_and_validate_args(extra_args_provider=add_generate_args, args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
             'no_load_rng': True,
             'no_load_optim': True,
-        },
-    )
+        })
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_megatron(training=False)
 
     check_arguments()
 
     args = get_args()
+
+    # Meta device initialization for ParallelLinear only works if using cpu initialization.
+    # Meta device initialization is used such that models can be materialized in low-precision
+    # directly when ModelOpt real quant is used. Otherwise, the model is first initialized
+    # as BF16 in memory which may result in OOM and defeat the purpose of real quant.
+    if args.init_model_with_meta_device:
+        args.use_cpu_initialization = True
+    else:
+        warnings.warn(
+            "--init-model-with-meta-device is not set. If you would like to resume the "
+            "model in low-bit directly (low-memory initialization and skipping 16-bit), "
+            "--init-model-with-meta-device must be set.",
+            UserWarning,
+        )
+
+    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
+    report_current_memory_info()
+
+    unwrapped_model = unwrap_model(model)[0]
 
     default_conversations = [
         {
@@ -99,20 +126,24 @@ if __name__ == "__main__":
     else:
         dataset = load_dataset(args.finetune_hf_dataset, split=args.finetune_data_split)
 
-    tokenizer = get_tokenizer()._tokenizer
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    tokenizer = get_hf_tokenizer()
 
-    report_current_memory_info()
 
     if args.load is not None:
-        load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
+        load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.eval()
 
+    # Fold the scalars into weight for speedup.
+    # [TODO]: fold_weight current assumes all weight_quantizer has weight allocated;
+    # however, this is not the case when share_embeddings_and_output_weights is False.
+    if getattr(unwrapped_model, "share_embeddings_and_output_weights", False):
+        mtq.fold_weight(unwrapped_model)
+
     for idx, example in enumerate(dataset):
-        if idx > args.percentage * len(dataset):
+        if idx > args.fraction * len(dataset):
             break
         ref_conversations = get_conversations(example)
         new_conversations = []
@@ -130,12 +161,14 @@ if __name__ == "__main__":
                         )
                     )
                 )
-                input_ids = tokenizer.apply_chat_template(
-                    new_conversations, return_tensors="pt", add_generation_prompt=True
+                encoding = tokenizer.apply_chat_template(
+                    new_conversations, return_tensors="pt", add_generation_prompt=True, return_dict=True
                 )
-                output_ids = simple_generate(
-                    unwrapped_model, input_ids.cuda(), osl=args.osl, disable_tqdm=args.disable_tqdm
-                )
+                input_ids = encoding["input_ids"]
+                with torch.no_grad():
+                    output_ids = megatron_generate(
+                        unwrapped_model, input_ids.cuda(), osl=args.osl, disable_tqdm=args.disable_tqdm
+                    )
                 output_texts = tokenizer.batch_decode(output_ids)[0]
                 print_rank_0("{}".format(output_texts))
                 new_conversations.append({"role": "assistant", "content": output_texts})

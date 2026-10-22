@@ -6,13 +6,13 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
+)
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
 )
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -61,32 +61,38 @@ def common_test_parallel_reconfiguration_e2e(
     store_order="tp-dp-pp",
     src_tp_pp_kwargs=None,
     dst_tp_pp_kwargs=None,
+    src_model_init_kwargs=None,
+    dst_model_init_kwargs=None,
+    metadata=None,
 ):
     """Test model saving and loading with different TP/PP"""
+    src_model_init_kwargs = src_model_init_kwargs or {}
+    dst_model_init_kwargs = dst_model_init_kwargs or {}
     Utils.initialize_model_parallel(*src_tp_pp, **(src_tp_pp_kwargs or {}), order=load_order)
-    with TempNamedDir(
-        tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A'
-    ) as ckpt_dir_A, TempNamedDir(
-        tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B'
-    ) as ckpt_dir_B:
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A,
+        TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B,
+    ):
         # Save checkpoint A
         gpt_model_A = initialize_model_fn(
             1,
             src_layer_spec_fn,
             tensor_model_parallel_size=src_tp_pp[0],
             pipeline_model_parallel_size=src_tp_pp[1],
+            **src_model_init_kwargs,
         )
-        save_strategy = get_default_save_sharded_strategy()
+        save_strategy = TorchDistSaveShardedStrategy()
         if use_fpsl:
             save_strategy = FullyParallelSaveStrategyWrapper(
                 save_strategy,
                 parallel_state.get_data_parallel_group(with_context_parallel=True),
                 True,
             )
-        save(gpt_model_A.sharded_state_dict(), ckpt_dir_A, save_strategy)
+        save(gpt_model_A.sharded_state_dict(metadata=metadata), ckpt_dir_A, save_strategy)
         regular_state_dict_A = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
-
+        if metadata is not None:
+            metadata.pop("dp_cp_group")
         # Load checkpoint A with different TP/PP and save as checkpoint B
         # No FPS this time, only FPL
         Utils.initialize_model_parallel(*dest_tp_pp, **(dst_tp_pp_kwargs or {}), order=store_order)
@@ -95,14 +101,15 @@ def common_test_parallel_reconfiguration_e2e(
             dst_layer_spec_fn,
             tensor_model_parallel_size=dest_tp_pp[0],
             pipeline_model_parallel_size=dest_tp_pp[1],
+            **dst_model_init_kwargs,
         )
         if use_fpsl:
-            load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+            load_strategy = TorchDistLoadShardedStrategy()
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
         else:
             load_strategy = None
         state_dict, missing_keys, unexpected_keys = load(
-            gpt_model_B.sharded_state_dict(),
+            gpt_model_B.sharded_state_dict(metadata=metadata),
             ckpt_dir_A,
             load_strategy,
             strict=StrictHandling.RETURN_ALL,
@@ -111,7 +118,7 @@ def common_test_parallel_reconfiguration_e2e(
         assert all('_extra_state' in k for k in missing_keys)
         assert all('_extra_state' in k for k in unexpected_keys)
         gpt_model_B.load_state_dict(state_dict)
-        save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
+        save(gpt_model_B.sharded_state_dict(metadata=metadata), ckpt_dir_B)
         regular_state_dict_B = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
 
@@ -134,15 +141,95 @@ def common_test_parallel_reconfiguration_e2e(
         Utils.destroy_model_parallel()
 
 
+def common_test_pg_distribution_cache_e2e(
+    initialize_model_fn, tmp_path_dist_ckpt, parallelization_group, sharded_state_dict_fn=None
+):
+    """Save/load a real sharded model with and without the PG-distribution cache.
+
+    The cache only changes *how* the fully-parallel save/load distribution is
+    obtained, so it must be invisible end to end: the checkpoint written through it
+    and the state dict loaded through it have to match the ones produced without it.
+
+    Both halves use the same parallel layout, which is the only regime the cache is
+    valid for (it is keyed by the parallelization group), and it mirrors how the
+    feature is used in practice: one job creates the cache, a later job with the
+    same config reuses it and skips the distribution all_gather.
+    """
+    from megatron.core.dist_checkpointing import exchange_utils
+
+    if sharded_state_dict_fn is None:
+        sharded_state_dict_fn = lambda model: model.sharded_state_dict()
+
+    def _save(model, ckpt_dir, pg_cache_path=None, pg_cache_create=False):
+        save_strategy = FullyParallelSaveStrategyWrapper(
+            TorchDistSaveShardedStrategy(),
+            parallelization_group,
+            True,
+            pg_cache_path=pg_cache_path,
+            pg_cache_create=pg_cache_create,
+        )
+        save(sharded_state_dict_fn(model), ckpt_dir, save_strategy)
+
+    def _load(model, ckpt_dir, pg_cache_path=None):
+        load_strategy = FullyParallelLoadStrategyWrapper(
+            TorchDistLoadShardedStrategy(), parallelization_group, pg_cache_path=pg_cache_path
+        )
+        state_dict, missing_keys, unexpected_keys = load(
+            sharded_state_dict_fn(model), ckpt_dir, load_strategy, strict=StrictHandling.RETURN_ALL
+        )
+        # Potential mismatch is because of extra states which is ok
+        assert all('_extra_state' in k for k in missing_keys)
+        assert all('_extra_state' in k for k in unexpected_keys)
+        return state_dict
+
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / 'pg_cache_dir', sync=True) as cache_dir,
+        TempNamedDir(tmp_path_dist_ckpt / 'pg_cache_ckpt_plain', sync=True) as ckpt_dir_plain,
+        TempNamedDir(tmp_path_dist_ckpt / 'pg_cache_ckpt_cached', sync=True) as ckpt_dir_cached,
+    ):
+        cache_path = str(cache_dir)
+        model_A = initialize_model_fn(1)
+
+        # Reference save, then the same save with the cache being created.
+        exchange_utils._PG_DIST_CACHE.clear()
+        _save(model_A, ckpt_dir_plain)
+        exchange_utils._PG_DIST_CACHE.clear()
+        _save(model_A, ckpt_dir_cached, pg_cache_path=cache_path, pg_cache_create=True)
+        torch.distributed.barrier()
+
+        # Load both back into freshly initialized models (seed 2, so the loaded
+        # values can only come from the checkpoints). The cached load drops the
+        # in-process memo first so it genuinely reads the distribution from disk.
+        model_B_plain = initialize_model_fn(2)
+        exchange_utils._PG_DIST_CACHE.clear()
+        loaded_plain = _load(model_B_plain, ckpt_dir_plain)
+
+        model_B_cached = initialize_model_fn(2)
+        exchange_utils._PG_DIST_CACHE.clear()
+        loaded_cached = _load(model_B_cached, ckpt_dir_cached, pg_cache_path=cache_path)
+
+        # The cached load must return exactly what the uncached load returns.
+        diffs = diff(loaded_plain, loaded_cached)
+        assert not any(map(bool, diffs)), diffs
+
+        # ... and both checkpoints must hold the same tensors on disk.
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+        diffs = diff(load_plain_tensors(ckpt_dir_plain), load_plain_tensors(ckpt_dir_cached))
+        assert not any(map(bool, diffs)), diffs
+
+    exchange_utils._PG_DIST_CACHE.clear()
+    Utils.destroy_model_parallel()
+
+
 def common_test_state_dict_comparison(initialize_model_fn, tmp_path_dist_ckpt):
     tp = 2
     pp = 4
     Utils.initialize_model_parallel(tp, pp)
-    with TempNamedDir(
-        tmp_path_dist_ckpt / 'test_state_dict_comparison_A'
-    ) as ckpt_dir_A, TempNamedDir(
-        tmp_path_dist_ckpt / 'test_state_dict_comparison_B'
-    ) as ckpt_dir_B:
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_A') as ckpt_dir_A,
+        TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_B') as ckpt_dir_B,
+    ):
         gpt_model_A = initialize_model_fn(
             1, tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp
         )
@@ -182,11 +269,10 @@ def common_test_vocab_size_padding_change(
         'embedding.word_embeddings.weight',
     }
 
-    with TempNamedDir(
-        tmp_path_dist_ckpt / 'test_vocab_size_padding_change_A'
-    ) as ckpt_dir_A, TempNamedDir(
-        tmp_path_dist_ckpt / 'test_vocab_size_padding_change_B'
-    ) as ckpt_dir_B:
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / 'test_vocab_size_padding_change_A') as ckpt_dir_A,
+        TempNamedDir(tmp_path_dist_ckpt / 'test_vocab_size_padding_change_B') as ckpt_dir_B,
+    ):
         # Save checkpoint A
         Utils.initialize_model_parallel(*src_tp_pp)
         gpt_model_A = initialize_model_fn(

@@ -1,8 +1,11 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import pytest
 import torch
 import torch.distributed as dist
 
 from megatron.core import parallel_state
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
     recv_from_prev_pipeline_rank_,
@@ -20,6 +23,9 @@ class TestCommunicationWithCustomPPGroup:
         """Set up test parameters."""
         self.size = [16, 8]
         self.dtype = torch.float32
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"),
@@ -46,10 +52,13 @@ class TestCommunicationWithCustomPPGroup:
             size=self.size, dtype=self.dtype, tensor=local_tensor
         )
 
-        # Align with mcore minor-to-major order: tp-cp-dp-pp
-        # Note init_device_mesh uses major-to-minor order, reverse the order of mcore
-        mesh = dist.init_device_mesh("cuda", (pp_size, tp_size), mesh_dim_names=["pp", "tp"])
-        pp_group = mesh.get_group(mesh_dim="pp")
+        # Initialize torch.distributed if not already initialized
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl')
+
+        # Note: HyperCommGrid uses minor-to-major order (tp, pp), which is reverse of device mesh
+        grid = HyperCommGrid([tp_size, pp_size], ["tp", "pp"])
+        pp_group = grid.create_pg("pp")
 
         # Broadcast using custom pp_group
         tensor_received_custom = broadcast_from_last_pipeline_stage(
@@ -61,7 +70,8 @@ class TestCommunicationWithCustomPPGroup:
         assert torch.allclose(
             tensor_received_global, tensor_received_custom
         ), "broadcast_from_last_pipeline_stage should be the same with or without custom pp_group"
-        Utils.destroy_model_parallel()
+
+        grid.destroy()
 
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"),
@@ -100,10 +110,13 @@ class TestCommunicationWithCustomPPGroup:
 
         dist.barrier()
 
-        # Align with mcore minor-to-major order: tp-cp-dp-pp
-        # Note init_device_mesh uses major-to-minor order, reverse the order of mcore
-        mesh = dist.init_device_mesh("cuda", (pp_size, tp_size), mesh_dim_names=["pp", "tp"])
-        pp_group = mesh.get_group(mesh_dim="pp")
+        # Initialize torch.distributed if not already initialized
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl')
+
+        # Note: HyperCommGrid uses minor-to-major order (tp, pp), which is reverse of device mesh
+        grid = HyperCommGrid([tp_size, pp_size], ["tp", "pp"])
+        pp_group = grid.create_pg("pp")
 
         # Send/recv using custom pp_group
         if pp_group.rank() != 0:
@@ -119,4 +132,5 @@ class TestCommunicationWithCustomPPGroup:
         assert torch.allclose(
             local_recv_buffer_global, local_recv_buffer_custom
         ), "Custom and global recv buffers should be the same."
-        Utils.destroy_model_parallel()
+
+        grid.destroy()
